@@ -1,0 +1,733 @@
+import speech_recognition as sr
+import pyttsx3
+import numpy as np
+from scipy.signal import butter, lfilter, convolve
+from scipy.spatial.distance import cosine
+from sympy import sympify, solve, diff, integrate
+import re
+import os
+import webbrowser
+import shutil
+import subprocess
+import json
+import difflib
+from datetime import datetime
+import requests
+from bs4 import BeautifulSoup
+from googlesearch import search
+import wikipedia
+from PIL import Image
+import io
+import cv2
+import time
+import librosa
+from skimage.restoration import richardson_lucy
+from scipy.ndimage import gaussian_filter
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+recognizer = sr.Recognizer()
+app_cache = {}
+app_index = {}
+MEMORY_FILE = "memory.json"
+IMAGE_MEMORY_FILE = "image_memory.json"
+AUDIO_MEMORY_FILE = "audio_memory.json"
+RECORDED_AUDIO_DIR = "recorded_audio"
+CAPTURED_IMAGE_DIR = "captured_images"
+AUDIO_PLOT_DIR = "plots/audio"
+IMAGE_PLOT_DIR = "plots/images"
+
+for directory in [RECORDED_AUDIO_DIR, CAPTURED_IMAGE_DIR, AUDIO_PLOT_DIR, IMAGE_PLOT_DIR]:
+    if not os.path.exists(directory):
+        try:
+            os.makedirs(directory)
+            print(f"Created directory: {directory}")
+        except Exception as e:
+            print(f"⚠️ Failed to create directory {directory}: {e}")
+
+def save_audio_plot(data, sample_rate, title, filename, ylabel="Amplitude", description=""):
+    try:
+        plt.figure(figsize=(10, 4))
+        time_axis = np.linspace(0, len(data) / sample_rate, num=len(data))
+        plt.plot(time_axis, data)
+        plt.title(f"{title}\n{description}", fontsize=10)
+        plt.xlabel("Time (s)")
+        plt.ylabel(ylabel)
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(filename)
+        plt.close()
+        print(f"✅ Saved audio plot: {filename}")
+    except Exception as e:
+        print(f"⚠️ Audio Plotting Error for {filename}: {e}")
+
+def save_mfcc_plot(mfccs, title, filename, description=""):
+    try:
+        plt.figure(figsize=(10, 4))
+        plt.plot(mfccs, marker='o')
+        plt.title(f"{title}\n{description}", fontsize=10)
+        plt.xlabel("MFCC Coefficient Index")
+        plt.ylabel("Amplitude")
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(filename)
+        plt.close()
+        print(f"✅ Saved MFCC plot: {filename}")
+    except Exception as e:
+        print(f"⚠️ MFCC Plotting Error for {filename}: {e}")
+
+def save_histogram_plot(hist, title, filename, description=""):
+    try:
+        plt.figure(figsize=(10, 4))
+        plt.plot(hist)
+        plt.title(f"{title}\n{description}", fontsize=10)
+        plt.xlabel("Pixel Intensity")
+        plt.ylabel("Normalized Frequency")
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(filename)
+        plt.close()
+        print(f"✅ Saved histogram plot: {filename}")
+    except Exception as e:
+        print(f"⚠️ Histogram Plotting Error for {filename}: {e}")
+
+def save_comparison_histogram_plot(hist1, hist2, title, filename, description=""):
+    try:
+        plt.figure(figsize=(10, 4))
+        plt.plot(hist1, label="Input Image")
+        plt.plot(hist2, label="Matched Image", linestyle="--")
+        plt.title(f"{title}\n{description}", fontsize=10)
+        plt.xlabel("Pixel Intensity")
+        plt.ylabel("Normalized Frequency")
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(filename)
+        plt.close()
+        print(f"✅ Saved comparison histogram plot: {filename}")
+    except Exception as e:
+        print(f"⚠️ Comparison Histogram Plotting Error for {filename}: {e}")
+
+def save_image_intensity_plot(img1, img2, title, filename, description=""):
+    try:
+        intensity1 = np.mean(img1, axis=(0, 2)) if len(img1.shape) == 3 else np.mean(img1, axis=0)
+        intensity2 = np.mean(img2, axis=(0, 2)) if len(img2.shape) == 3 else np.mean(img2, axis=0)
+        plt.figure(figsize=(10, 4))
+        plt.plot(intensity1, label="Original Image")
+        plt.plot(intensity2, label="Deblurred Image", linestyle="--")
+        plt.title(f"{title}\n{description}", fontsize=10)
+        plt.xlabel("Row Index")
+        plt.ylabel("Mean Intensity")
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(filename)
+        plt.close()
+        print(f"✅ Saved intensity plot: {filename}")
+    except Exception as e:
+        print(f"⚠️ Intensity Plotting Error for {filename}: {e}")
+
+def speak(text):
+    try:
+        engine = pyttsx3.init()
+        engine.setProperty('rate', 150)
+        engine.setProperty('volume', 1.0)
+        engine.say(text)
+        engine.runAndWait()
+    except Exception as e:
+        print(f"⚠️ TTS Error: {e}")
+
+def butter_bandpass(lowcut, highcut, fs, order=5):
+    nyq = 0.5 * fs
+    low = lowcut / nyq
+    high = highcut / nyq
+    b, a = butter(order, [low, high], btype='band')
+    return b, a
+
+def bandpass_filter(data, lowcut=300, highcut=3400, fs=16000, order=5):
+    b, a = butter_bandpass(lowcut, highcut, fs, order=order)
+    return lfilter(b, a, data)
+
+def preprocess_audio(audio_data, sample_rate):
+    try:
+        audio_np = np.frombuffer(audio_data, dtype=np.int16)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        save_audio_plot(audio_np, sample_rate, "Raw Audio Signal", 
+                        os.path.join(AUDIO_PLOT_DIR, f"raw_audio_{timestamp}.png"),
+                        description="Original audio waveform from recorded audio")
+        filtered = bandpass_filter(audio_np, 300, 3400, fs=sample_rate, order=6)
+        save_audio_plot(filtered, sample_rate, "Bandpass Filtered Audio", 
+                        os.path.join(AUDIO_PLOT_DIR, f"filtered_audio_{timestamp}.png"),
+                        description="Audio after 300-3400 Hz bandpass filter to isolate voice frequencies")
+        fft_signal = np.fft.fft(filtered)
+        magnitude = np.abs(fft_signal)
+        freqs = np.fft.fftfreq(len(magnitude), 1/sample_rate)
+        save_audio_plot(magnitude[:len(magnitude)//2], sample_rate/2, 
+                        "FFT Magnitude Spectrum", 
+                        os.path.join(AUDIO_PLOT_DIR, f"fft_magnitude_{timestamp}.png"),
+                        ylabel="Magnitude",
+                        description="Frequency spectrum after Fourier transform, showing dominant frequencies")
+        threshold = np.max(magnitude) * 0.01
+        fft_signal[magnitude < threshold] = 0
+        filtered_fft = np.fft.ifft(fft_signal).real
+        save_audio_plot(filtered_fft, sample_rate, "Filtered FFT Signal", 
+                        os.path.join(AUDIO_PLOT_DIR, f"filtered_fft_{timestamp}.png"),
+                        description="Time-domain signal after suppressing low-magnitude frequencies")
+        kernel = np.ones(5)/5
+        smoothed = convolve(filtered_fft, kernel, mode="same")
+        save_audio_plot(smoothed, sample_rate, "Smoothed Audio Signal", 
+                        os.path.join(AUDIO_PLOT_DIR, f"smoothed_audio_{timestamp}.png"),
+                        description="Signal after applying moving average to reduce noise")
+        voice_indices = np.where(np.abs(smoothed) > 500)[0]
+        if len(voice_indices) > 0:
+            smoothed = smoothed[voice_indices[0]:voice_indices[-1]+1]
+            save_audio_plot(smoothed, sample_rate, "Trimmed Audio Signal", 
+                            os.path.join(AUDIO_PLOT_DIR, f"trimmed_audio_{timestamp}.png"),
+                            description="Final signal with silent portions removed, focusing on voice")
+        return smoothed.astype(np.int16).tobytes(), smoothed
+    except Exception as e:
+        print(f"⚠️ Audio Processing Error: {e}")
+        return None, None
+
+def extract_image_features(image_data):
+    try:
+        img = cv2.imdecode(np.frombuffer(image_data, np.uint8), cv2.IMREAD_GRAYSCALE)
+        max_size = 300
+        height, width = img.shape
+        scale = max_size / max(height, width)
+        if scale < 1:
+            img = cv2.resize(img, (int(width * scale), int(height * scale)), interpolation=cv2.INTER_AREA)
+        hist = cv2.calcHist([img], [0], None, [256], [0, 256])
+        cv2.normalize(hist, hist)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        save_histogram_plot(hist.flatten(), "Image Histogram (Grayscale)", 
+                           os.path.join(IMAGE_PLOT_DIR, f"histogram_{timestamp}.png"),
+                           description="Normalized histogram of grayscale pixel intensities for feature extraction")
+        return hist.flatten().tolist()
+    except Exception as e:
+        print(f"⚠️ Image Feature Extraction Error: {e}")
+        return None
+
+def match_image(image_data):
+    try:
+        input_features = extract_image_features(image_data)
+        if input_features is None:
+            return None
+        input_hist = np.array(input_features, dtype=np.float32)
+        image_memory = load_image_memory()
+        if not image_memory:
+            print("⚠️ No image features available for matching")
+            return None
+        best_match = None
+        best_similarity = -np.inf
+        for desc, data in image_memory.items():
+            stored_hist = np.array(data.get("features"), dtype=np.float32)
+            similarity = cv2.compareHist(input_hist, stored_hist, cv2.HISTCMP_CORREL)
+            if similarity > best_similarity:
+                best_similarity = similarity
+                best_match = desc
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                save_comparison_histogram_plot(input_hist, stored_hist,
+                                              f"Histogram Comparison (Input vs {desc})",
+                                              os.path.join(IMAGE_PLOT_DIR, f"match_histogram_{timestamp}.png"),
+                                              description="Comparing input image histogram to stored image for matching (higher overlap = better match)")
+        return best_match if best_similarity > 0.8 else None
+    except Exception as e:
+        print(f"⚠️ Image Matching Error: {e}")
+        return None
+
+def capture_image(image_source="webcam"):
+    try:
+        if image_source == "webcam":
+            cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+            if not cap.isOpened():
+                return None, "Failed to open webcam. Ensure it is connected and not in use."
+            time.sleep(1)
+            ret, frame = cap.read()
+            cap.release()
+            if not ret:
+                return None, "Failed to capture image from webcam"
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = os.path.join(CAPTURED_IMAGE_DIR, f"captured_{timestamp}.jpg")
+            cv2.imwrite(filename, frame)
+            cv2.imshow("Captured Image", frame)
+            cv2.waitKey(0)
+            cv2.destroyAllWindows()
+            _, buffer = cv2.imencode('.jpg', frame)
+            return buffer.tobytes(), f"Image captured from webcam, saved as {filename}, and displayed on screen"
+        else:
+            if os.path.exists(image_source):
+                img = cv2.imread(image_source)
+                if img is None:
+                    return None, f"Failed to load image from {image_source}"
+                _, buffer = cv2.imencode('.jpg', img)
+                return buffer.tobytes(), f"Image loaded from {image_source}"
+            return None, f"File {image_source} not found"
+    except Exception as e:
+        return None, f"Image Capture Error: {e}"
+
+def deblur_image(description):
+    try:
+        image_memory = load_image_memory()
+        if description not in image_memory:
+            return None, f"No image found for description: {description}"
+        image_data = bytes.fromhex(image_memory[description]["data"])
+        img = cv2.imdecode(np.frombuffer(image_data, np.uint8), cv2.IMREAD_COLOR)
+        if img is None:
+            return None, f"Failed to decode image for description: {description}"
+        img = img.astype(np.float32) / 255.0
+        kernel_size = 5
+        sigma = kernel_size / 4.0
+        psf = np.zeros((kernel_size, kernel_size))
+        center = kernel_size // 2
+        for i in range(kernel_size):
+            for j in range(kernel_size):
+                psf[i, j] = np.exp(-((i - center) ** 2 + (j - center) ** 2) / (2 * sigma ** 2))
+        psf /= psf.sum()
+        deblurred = np.zeros_like(img)
+        for channel in range(img.shape[2]):
+            deblurred[:, :, channel] = richardson_lucy(
+                img[:, :, channel], psf, num_iter=15, clip=True
+            )
+        deblurred = np.clip(deblurred * 255, 0, 255).astype(np.uint8)
+        sharpening_kernel = np.array([
+            [0, -1, 0],
+            [-1, 5, -1],
+            [0, -1, 0]
+        ])
+        deblurred = cv2.filter2D(deblurred, -1, sharpening_kernel)
+        original_img = cv2.imdecode(np.frombuffer(image_data, np.uint8), cv2.IMREAD_COLOR)
+        cv2.imshow("Original Image", original_img)
+        cv2.imshow("Deblurred Image", deblurred)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        save_image_intensity_plot(original_img, deblurred,
+                                 f"Intensity Profile Comparison ({description})",
+                                 os.path.join(IMAGE_PLOT_DIR, f"deblur_intensity_{timestamp}.png"),
+                                 description="Mean intensity across rows, showing enhanced sharpness after Richardson-Lucy deconvolution and sharpening")
+        _, buffer = cv2.imencode('.jpg', deblurred)
+        return buffer.tobytes(), f"Deblurred image for {description} and displayed on screen"
+    except Exception as e:
+        print(f"⚠️ Image Clear Error: {e}")
+        return None, f"Image Clear Error: {e}"
+
+def save_image_memory(image_data, description):
+    try:
+        image_memory = load_image_memory()
+        features = extract_image_features(image_data)
+        if features is None:
+            return f"Failed to save image: Could not extract features"
+        image_memory[description] = {
+            "data": image_data.hex(),
+            "features": features
+        }
+        with open(IMAGE_MEMORY_FILE, "w") as f:
+            json.dump(image_memory, f, indent=2)
+        return f"Saved image with description: {description}"
+    except Exception as e:
+        return f"Failed to save image to memory: {e}"
+
+def load_image_memory():
+    try:
+        if os.path.exists(IMAGE_MEMORY_FILE):
+            with open(IMAGE_MEMORY_FILE, "r") as f:
+                image_memory = json.load(f)
+            valid_memory = {}
+            for desc, data in image_memory.items():
+                if isinstance(data, dict) and "data" in data and "features" in data:
+                    valid_memory[desc] = data
+                else:
+                    print(f"⚠️ Invalid image memory entry for {desc}, discarding")
+            return valid_memory
+        return {}
+    except Exception as e:
+        print(f"⚠️ Image Memory Load Error: {e}")
+        return {}
+
+def record_audio(sample_rate=16000):
+    try:
+        with sr.Microphone(sample_rate=sample_rate) as mic_source:
+            recognizer.adjust_for_ambient_noise(mic_source)
+            print("Recording... Speak now (stops after silence).")
+            audio = recognizer.listen(mic_source, timeout=5, phrase_time_limit=None)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = os.path.join(RECORDED_AUDIO_DIR, f"recording_{timestamp}.wav")
+            with open(filename, "wb") as f:
+                f.write(audio.get_wav_data())
+            processed, _ = preprocess_audio(audio.get_raw_data(), sample_rate)
+            if processed is None:
+                return None, None, "Failed to preprocess recorded audio"
+            return processed, sample_rate, f"Audio recorded and saved as {filename}"
+    except Exception as e:
+        print(f"⚠️ Audio Recording Error: {e}")
+        return None, None, f"Failed to record audio: {e}"
+
+def extract_voice_features(audio_data, sample_rate):
+    try:
+        audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
+        if len(audio_np) < sample_rate // 10:
+            raise ValueError("Audio too short for reliable feature extraction")
+        mfccs = librosa.feature.mfcc(y=audio_np, sr=sample_rate, n_mfcc=13)
+        mean_mfccs = np.mean(mfccs, axis=1)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        save_mfcc_plot(mean_mfccs, "MFCC Features", 
+                       os.path.join(AUDIO_PLOT_DIR, f"mfcc_{timestamp}.png"),
+                       description="Mean MFCCs capturing spectral characteristics for speaker identification")
+        return mean_mfccs
+    except Exception as e:
+        print(f"⚠️ Voice Feature Extraction Error: {e}")
+        return None
+
+def save_audio_memory(audio_data, sample_rate, description):
+    try:
+        features = extract_voice_features(audio_data, sample_rate)
+        if features is None:
+            return "Failed to extract voice features"
+        if features.shape != (13,):
+            raise ValueError(f"Invalid feature shape: {features.shape}")
+        audio_memory = load_audio_memory()
+        audio_memory[description] = features.tolist()
+        with open(AUDIO_MEMORY_FILE, "w") as f:
+            json.dump(audio_memory, f, indent=2)
+        return f"Saved voice with description: {description}"
+    except Exception as e:
+        return f"Failed to save voice to memory: {e}"
+
+def load_audio_memory():
+    try:
+        if os.path.exists(AUDIO_MEMORY_FILE):
+            with open(AUDIO_MEMORY_FILE, "r") as f:
+                audio_memory = json.load(f)
+            valid_memory = {}
+            for desc, features in audio_memory.items():
+                features = np.array(features)
+                if features.shape == (13,):
+                    valid_memory[desc] = features.tolist()
+                else:
+                    print(f"⚠️ Invalid feature shape for {desc}: {features.shape}, discarding")
+            return valid_memory
+        return {}
+    except Exception as e:
+        print(f"⚠️ Audio Memory Load Error: {e}")
+        return {}
+
+def match_audio(audio_data, sample_rate):
+    try:
+        input_features = extract_voice_features(audio_data, sample_rate)
+        if input_features is None:
+            return None
+        if input_features.shape != (13,):
+            raise ValueError(f"Invalid input feature shape: {input_features.shape}")
+        audio_memory = load_audio_memory()
+        if not audio_memory:
+            print("⚠️ No voiceprints available for matching")
+            return None
+        best_match = None
+        best_similarity = -np.inf
+        for desc, stored_features in audio_memory.items():
+            stored_features = np.array(stored_features)
+            if stored_features.shape != (13,):
+                print(f"⚠️ Skipping {desc}: Invalid stored feature shape {stored_features.shape}")
+                continue
+            similarity = 1 - cosine(input_features, stored_features)
+            if similarity > best_similarity:
+                best_similarity = similarity
+                best_match = desc
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                save_mfcc_plot(np.vstack([input_features, stored_features]).T, 
+                               f"MFCC Comparison (Input vs {desc})",
+                               os.path.join(AUDIO_PLOT_DIR, f"mfcc_match_{timestamp}.png"),
+                               description="Comparing input audio MFCCs to stored voiceprint (closer alignment = better match)")
+        return best_match if best_similarity > 0.85 else None
+    except Exception as e:
+        print(f"⚠️ Voice Matching Error: {e}")
+        return None
+
+def solve_advanced_math(expression):
+    try:
+        expr = sympify(expression)
+        if expr.is_number:
+            return f"The solution is {expr}"
+        result = solve(expr)
+        return f"The solution is {result}"
+    except:
+        try:
+            expr = sympify(expression)
+            return f"Derivative: {diff(expr)}, Integral: {integrate(expr)}"
+        except:
+            return "Sorry, I could not solve that math problem."
+
+def physics_calculator(question):
+    try:
+        if "force" in question and "mass" in question and "acceleration" in question:
+            m = re.search(r"mass (\d+\.?\d*)", question)
+            a = re.search(r"acceleration (\d+\.?\d*)", question)
+            if m and a:
+                return f"The force is {float(m.group(1))*float(a.group(1))} N"
+        if "pressure" in question and "force" in question and "area" in question:
+            F = re.search(r"force (\d+\.?\d*)", question)
+            A = re.search(r"area (\d+\.?\d*)", question)
+            if F and A:
+                return f"The pressure is {float(F.group(1))/float(A.group(1))} Pa"
+        if "speed" in question and "distance" in question and "time" in question:
+            d = re.search(r"distance (\d+\.?\d*)", question)
+            t = re.search(r"time (\d+\.?\d*)", question)
+            if d and t:
+                return f"The speed is {float(d.group(1))/float(t.group(1))} m/s"
+        return None
+    except Exception as e:
+        print(f"⚠️ Physics Calculation Error: {e}")
+        return None
+
+def google_search_summary(query, num_results=3):
+    try:
+        collected = []
+        for url in search(query, num_results=num_results):
+            try:
+                r = requests.get(url, timeout=5, headers={"User-Agent": "Mozilla/5.0"})
+                soup = BeautifulSoup(r.text, "html.parser")
+                p = soup.find_all("p")
+                for para in p[:2]:
+                    text = para.get_text().strip()
+                    if len(text) > 50:
+                        collected.append(text)
+                        break
+            except:
+                continue
+        return " ".join(collected)[:500]+"..." if collected else None
+    except Exception as e:
+        print(f"⚠️ Google Search Error: {e}")
+        return None
+
+def wiki_answer(query):
+    try:
+        return wikipedia.summary(query, sentences=2, auto_suggest=True, redirect=True)
+    except Exception as e:
+        print(f"⚠️ Wikipedia Search Error: {e}")
+        return None
+
+def load_memory():
+    try:
+        if os.path.exists(MEMORY_FILE):
+            with open(MEMORY_FILE, "r") as f:
+                return json.load(f)
+        return {}
+    except Exception as e:
+        print(f"⚠️ Memory Load Error: {e}")
+        return {}
+
+def save_memory():
+    try:
+        with open(MEMORY_FILE, "w") as f:
+            json.dump(dynamic_knowledge, f, indent=2)
+    except Exception as e:
+        print(f"⚠️ Memory Save Error: {e}")
+
+dynamic_knowledge = load_memory()
+
+def build_app_index():
+    global app_index
+    try:
+        common_paths = [
+            os.path.join(os.environ["APPDATA"], r"Microsoft\Windows\Start Menu\Programs"),
+            os.path.join(os.environ["ProgramData"], r"Microsoft\Windows\Start Menu\Programs"),
+        ]
+        for base in common_paths:
+            if not os.path.exists(base): continue
+            for root, dirs, files in os.walk(base):
+                for f in files:
+                    if f.lower().endswith((".lnk", ".exe")):
+                        key = os.path.splitext(f)[0].lower()
+                        app_index[key] = os.path.join(root, f)
+    except Exception as e:
+        print(f"⚠️ App Index Build Error: {e}")
+
+def predict_word(word, choices):
+    try:
+        matches = difflib.get_close_matches(word, choices, n=1, cutoff=0.6)
+        return matches[0] if matches else word
+    except Exception as e:
+        print(f"⚠️ Word Prediction Error: {e}")
+        return word
+
+def make_website_url(name):
+    try:
+        name = name.lower().replace(" ", "")
+        if not name.startswith("http"):
+            return f"https://www.{name}.com"
+        return name
+    except Exception as e:
+        print(f"⚠️ Website URL Error: {e}")
+        return name
+
+def open_command(command):
+    global app_cache, app_index
+    try:
+        if "open" not in command: return None
+        words = command.split("open",1)[1].strip().lower()
+        all_choices = list(app_index.keys()) + list(dynamic_knowledge.keys()) + \
+                      ["youtube","facebook","google","github","twitter","instagram","reddit"]
+        words = predict_word(words, all_choices)
+        if words in app_cache:
+            os.startfile(app_cache[words])
+            return f"Opening {words}"
+        if "." in words or "www" in words or words in all_choices:
+            url = make_website_url(words)
+            webbrowser.open(url)
+            return f"Opening {url}"
+        exe = shutil.which(words)
+        if exe:
+            subprocess.Popen([exe], shell=True)
+            app_cache[words] = exe
+            return f"Opening {words}"
+        for key, path in app_index.items():
+            if words in key:
+                os.startfile(path)
+                app_cache[words] = path
+                return f"Opening {key}"
+        return None
+    except Exception as e:
+        print(f"⚠️ Open Command Error: {e}")
+        return None
+
+knowledge_base = {
+    "your name": "I am your advanced voice assistant.",
+    "who are you": "I am an AI assistant that can solve math, answer science questions, open apps/websites, capture images, and match voices and images.",
+    "hello": "Hello! How can I help you today?",
+    "hi": "Hi there! What can I do for you?",
+    "how are you": "I am functioning perfectly, thank you!",
+    "time": f"The current time is {datetime.now().strftime('%I:%M %p')}",
+    "date": f"Today is {datetime.now().strftime('%A, %d %B %Y')}",
+    "bye": "Goodbye! Have a nice day!"
+}
+
+def get_answer(question, audio_data=None, sample_rate=None, image_data=None):
+    try:
+        q_lower = question.lower()
+        if q_lower in dynamic_knowledge:
+            return dynamic_knowledge[q_lower]
+        if "capture image" in q_lower:
+            image_source = "webcam"
+            if "from file" in q_lower:
+                image_source = q_lower.split("from file")[-1].strip()
+            image_data, message = capture_image(image_source)
+            if image_data:
+                description = q_lower.replace("capture image", "").replace("from file", "").strip() or "captured_image"
+                save_image_memory(image_data, description)
+                return message
+            return message
+        if q_lower.startswith("match image"):
+            if image_data:
+                match = match_image(image_data)
+                if match and match in load_image_memory():
+                    return f"Image matched to: {match}"
+                return "Didn't match"
+            return "No image data available for matching"
+        if "clear image" in q_lower:
+            description = q_lower.replace("clear image", "").strip() or "cleared_image"
+            cleared, message = deblur_image(description)
+            if cleared:
+                save_image_memory(cleared, description)
+                return message
+            return message
+        if q_lower.startswith("record audio"):
+            audio_data, sample_rate, message = record_audio()
+            if audio_data:
+                description = q_lower.replace("record audio", "").strip() or f"voice_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                save_audio_memory(audio_data, sample_rate, description)
+                return message
+            return message
+        if q_lower.startswith("match audio"):
+            audio_data, sample_rate, message = record_audio()
+            if audio_data:
+                match = match_audio(audio_data, sample_rate)
+                if match and match in load_audio_memory():
+                    return f"Audio matched to: {match}"
+                return "Didn't match"
+            return message
+        open_result = open_command(q_lower)
+        if open_result: return open_result
+        if any(w in q_lower for w in ["calculate","solve","evaluate","derivative","integral"]):
+            expr = q_lower
+            for w in ["calculate","solve","evaluate","find derivative of","integral of"]:
+                expr = expr.replace(w,"")
+            result = solve_advanced_math(expr.strip())
+            dynamic_knowledge[q_lower] = result; save_memory()
+            return result
+        physics_result = physics_calculator(q_lower)
+        if physics_result:
+            dynamic_knowledge[q_lower] = physics_result; save_memory()
+            return physics_result
+        for key in knowledge_base:
+            if key in q_lower: return knowledge_base[key]
+        if "learn that" in q_lower:
+            try:
+                fact = q_lower.replace("learn that","").strip()
+                q,a = fact.split("is")
+                dynamic_knowledge[q.strip()] = a.strip()
+                save_memory()
+                return f"I have learned that {q.strip()} is {a.strip()}"
+            except:
+                return "Sorry, use: 'Learn that [question] is [answer]'"
+        wiki_result = wiki_answer(question)
+        if wiki_result:
+            dynamic_knowledge[q_lower] = wiki_result; save_memory()
+            return wiki_result
+        google_result = google_search_summary(question)
+        if google_result:
+            dynamic_knowledge[q_lower] = google_result; save_memory()
+            return google_result
+        return "Sorry, I don’t know that yet."
+    except Exception as e:
+        print(f"⚠️ Get Answer Error: {e}")
+        return f"Error processing command: {e}"
+
+print("🎤 Advanced Voice Assistant running... Say 'bye' to exit.")
+build_app_index()
+
+if os.path.exists(AUDIO_MEMORY_FILE):
+    os.remove(AUDIO_MEMORY_FILE)
+    print(f"Cleared {AUDIO_MEMORY_FILE} to ensure clean state.")
+
+if os.path.exists(IMAGE_MEMORY_FILE):
+    os.remove(IMAGE_MEMORY_FILE)
+    print(f"Cleared {IMAGE_MEMORY_FILE} to ensure clean state for new format.")
+
+while True:
+    try:
+        with sr.Microphone() as mic_source:
+            if not hasattr(mic_source, 'SAMPLE_RATE'):
+                print("⚠️ Microphone initialization failed. Retrying...")
+                continue
+            recognizer.adjust_for_ambient_noise(mic_source)
+            print("\nListening...")
+            audio = recognizer.listen(mic_source, timeout=5, phrase_time_limit=5)
+            audio_data = sr.AudioData(audio.get_raw_data(), mic_source.SAMPLE_RATE, mic_source.SAMPLE_WIDTH)
+            sample_rate = mic_source.SAMPLE_RATE
+            text = recognizer.recognize_google(audio_data)
+            print(f"✅ You said: {text}")
+        image_data = None
+        if "match image" in text.lower():
+            image_source = "webcam"
+            if "from file" in text.lower():
+                image_source = text.lower().split("from file")[-1].strip()
+            image_data, image_message = capture_image(image_source)
+            if image_data is None:
+                print(f"⚠️ Image Capture Failed: {image_message}")
+                speak(image_message)
+                continue
+        answer = get_answer(text, None, None, image_data)
+        print(f"🤖 Assistant: {answer}")
+        speak(answer)
+        if "bye" in text.lower():
+            break
+    except sr.UnknownValueError:
+        print("❌ Could not understand audio")
+    except sr.RequestError as e:
+        print(f"⚠️ Speech recognition service error: {e}")
+        speak(f"Speech recognition service error: {e}")
+    except Exception as e:
+        print(f"⚠️ Error: {e}")
+        speak("Something went wrong, but I am still running.")
